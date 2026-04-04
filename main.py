@@ -54,8 +54,8 @@ def get_env(key):
         raise ValueError(f"{key} is not set")
     return value
 
-SECRET_KEY = get_env(key)   # A secret key for password hashing
-GROQ_API_KEY = get_env(key) # Groq API Key for integrating with LLAMA (credits - Meta)
+SECRET_KEY = get_env("SECRET_KEY")   # A secret key for password hashing
+GROQ_API_KEY = get_env("GROQ_API_KEY") # Groq API Key for integrating with LLAMA (credits - Meta)
 
 STUDY_TIPS_POOL = [
     "🧠 The Feynman Technique: Explain concepts as if teaching a 12-year-old.",
