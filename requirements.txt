@@ -13,3 +13,4 @@ scikit-learn
 shap
 reportlab
 websockets
+psycopg2-binary
