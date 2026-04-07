@@ -2,7 +2,6 @@ fastapi
 uvicorn
 python-multipart
 pydantic
-sqlite3
 numpy
 pandas
 PyJWT
