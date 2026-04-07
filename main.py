@@ -1,27 +1,29 @@
-# StudyNest — main.py
-# pip install fastapi uvicorn python-jose[cryptography] pyjwt xgboost lightgbm
-#             scikit-learn shap pandas numpy reportlab httpx
-#
-# Set env vars:
-#   GROQ_API_KEY  — free at console.groq.com  (Llama-3 chatbot)
-#   SECRET_KEY    — any long random string
-#   DB_PATH       — path to sqlite file (default: study_agent.db)
-
 from fastapi import FastAPI, HTTPException, Response, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
-import sqlite3, os, hashlib, random, pickle, io, json
+import os, hashlib, random, pickle, io, json
 from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import jwt as pyjwt
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from dotenv import load_dotenv
-import os
+from contextlib import contextmanager
+
+# ── PostgreSQL connection pool ────────────────────────────────────────────────
+
+import psycopg2
+from psycopg2 import pool as pg_pool
+from psycopg2.extras import RealDictCursor   #
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 try:
     import httpx
@@ -37,25 +39,24 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 from sklearn.cluster import KMeans
 import shap
-
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors as rl_colors
 from reportlab.lib.pagesizes import letter
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
+SECRET_KEY         = os.environ.get("SECRET_KEY", "change-me-in-production-please")
 TOKEN_EXPIRY_HOURS = int(os.environ.get("TOKEN_EXPIRY_HOURS", 24))
-DB_PATH            = os.environ.get("DB_PATH", "study_agent.db")
+DATABASE_URL       = os.environ.get("DATABASE_URL")          # Set on Render / Supabase
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 FRONTEND_DIR       = os.path.dirname(os.path.abspath(__file__))
 
-def get_env(key):
-    value = os.environ.get(key)
-    if not value:
-        raise ValueError(f"{key} is not set")
-    return value
-
-SECRET_KEY = get_env("SECRET_KEY")   # A secret key for password hashing
-GROQ_API_KEY = get_env("GROQ_API_KEY") # Groq API Key for integrating with LLAMA (credits - Meta)
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is not set.\n"
+        "Set it to: postgresql://user:password@host:5432/dbname\n"
+        "Get it from Supabase → Settings → Database → Connection String → URI"
+    )
 
 STUDY_TIPS_POOL = [
     "🧠 The Feynman Technique: Explain concepts as if teaching a 12-year-old.",
@@ -84,49 +85,224 @@ STUDY_TIPS_POOL = [
     "🔁 Review at 1 day, 1 week, 1 month intervals for optimal long-term retention.",
     "💪 Exercise grows new neurons. Even 20 min/day makes a measurable difference.",
     "🤝 Teaching others is the most effective form of learning (Protégé Effect).",
-    "🎵 Baroque music at 60 BPM can sync with brain alpha waves for focus.",
-    "📖 SQ3R Method: Survey, Question, Read, Recite, Review.",
     "⚡ Multitasking reduces IQ by 10-15 points temporarily. Single-task only.",
     "🏗️ Build conceptual frameworks first, fill in details later.",
     "🌊 Flow state needs: clear goals, immediate feedback, and balanced challenge.",
     "⏳ Parkinson's Law: Work expands to fill time. Set tight deadlines.",
     "🧬 Neuroplasticity is real. Your brain can always improve with practice.",
-    "📝 The Leitner Box automates spaced repetition for flashcards.",
     "🌐 Socratic Method: Question everything. Deep understanding > surface recall.",
     "💭 Method of Loci: Link information to spatial memories for recall.",
-    "🎯 Implementation intentions: 'I will study X at Y in Z place' = 3x success.",
-    "🔦 What you value, your brain focuses on. Value learning above distractions.",
-    "📊 Mind maps help visual learners connect complex information webs.",
-    "🧩 Chunking: Group information into meaningful clusters to reduce cognitive load.",
-    "🌈 Color-code your notes by topic or importance level.",
-    "⚗️ The Generation Effect: Creating content (summaries, questions) > consuming it.",
-    "🕐 The best time to study is when you can do it consistently — find your rhythm.",
-    "🔑 Understanding the 'why' behind facts makes them 5x easier to remember.",
-    "🎪 Elaborative interrogation: Ask 'why is this true?' for every new fact.",
-    "📺 Use videos for complex visual concepts, but pause and recall frequently.",
-    "🏃 Physical warmth (tea, warm room) signals safety to the brain, reducing anxiety.",
-    "🌀 Confusion is a sign of learning, not failure. Sit with it — then seek clarity.",
     "📓 Keep a learning journal. Writing about what you learned cements it.",
     "🔮 Visualize yourself successfully using knowledge in exams. It works.",
-    "🎸 Even 5 minutes of music you love resets focus better than silence.",
+    "🌀 Confusion is a sign of learning, not failure. Sit with it — then seek clarity.",
+    "🎵 Even 5 minutes of music you love resets focus better than silence.",
+    "🏃 Physical warmth (tea, warm room) signals safety to the brain, reducing anxiety.",
+    "📖 SQ3R Method: Survey, Question, Read, Recite, Review.",
+    "🔑 Understanding the 'why' behind facts makes them 5x easier to remember.",
 ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONNECTION POOL
+# ══════════════════════════════════════════════════════════════════════════════
+_pool: pg_pool.SimpleConnectionPool = None
+
+def get_pool() -> pg_pool.SimpleConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = pg_pool.SimpleConnectionPool(
+            minconn=1, maxconn=10,
+            dsn=DATABASE_URL,
+            # Force SSL for Supabase — harmless if already in the URL
+            sslmode="require" if "supabase" in (DATABASE_URL or "") else "prefer"
+        )
+    return _pool
+
+@contextmanager
+def get_conn():
+    """Context manager — always returns connection back to pool."""
+    p = get_pool()
+    conn = p.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        p.putconn(conn)
+
+@contextmanager
+def get_cursor(conn):
+    """Return a RealDictCursor so rows behave like dicts (replaces row_factory)."""
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        yield c
+    finally:
+        c.close()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE INIT
+# ══════════════════════════════════════════════════════════════════════════════
+def init_db():
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users(
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            email TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS study_sessions(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER, subject TEXT, date TEXT, minutes INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS subjects_total(
+            subject TEXT, user_id INTEGER, total_minutes INTEGER DEFAULT 0,
+            PRIMARY KEY (subject, user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS user_stats(
+            id INTEGER PRIMARY KEY,
+            xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1, daily_goal INTEGER DEFAULT 180
+        )""",
+        """CREATE TABLE IF NOT EXISTS subjects_meta(
+            user_id INTEGER, subject TEXT,
+            difficulty TEXT DEFAULT 'Medium', last_test_score REAL DEFAULT 0,
+            PRIMARY KEY (user_id, subject)
+        )""",
+        """CREATE TABLE IF NOT EXISTS tasks(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER, task TEXT, subject TEXT, date TEXT,
+            priority TEXT DEFAULT 'Medium', completed TEXT DEFAULT 'No',
+            completed_date TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS subject_notes(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER, subject TEXT, note TEXT, created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS reset_tokens(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER, token TEXT, expires_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS user_profiles(
+            user_id INTEGER PRIMARY KEY,
+            bio TEXT DEFAULT '',
+            avatar_emoji TEXT DEFAULT '🎓',
+            role TEXT DEFAULT 'student',
+            fields_of_study TEXT DEFAULT '[]',
+            country TEXT DEFAULT '',
+            school TEXT DEFAULT '',
+            grade TEXT DEFAULT '',
+            website TEXT DEFAULT '',
+            is_public INTEGER DEFAULT 1,
+            joined_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS follows(
+            follower_id INTEGER,
+            followed_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY(follower_id, followed_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS community_posts(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            content TEXT,
+            subject_tag TEXT DEFAULT '',
+            post_type TEXT DEFAULT 'general',
+            created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS post_likes(
+            post_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY(post_id, user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS post_comments(
+            id SERIAL PRIMARY KEY,
+            post_id INTEGER,
+            user_id INTEGER,
+            comment TEXT,
+            created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS chat_rooms(
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            description TEXT DEFAULT '',
+            room_type TEXT DEFAULT 'subject',
+            created_by INTEGER,
+            created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS room_members(
+            room_id INTEGER,
+            user_id INTEGER,
+            joined_at TEXT,
+            PRIMARY KEY(room_id, user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS room_messages(
+            id SERIAL PRIMARY KEY,
+            room_id INTEGER,
+            user_id INTEGER,
+            message TEXT,
+            created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS monitored_users(
+            monitor_id INTEGER,
+            student_id INTEGER,
+            relationship TEXT DEFAULT 'teacher',
+            created_at TEXT,
+            PRIMARY KEY(monitor_id, student_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS chatbot_history(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            role TEXT,
+            content TEXT,
+            created_at TEXT
+        )""",
+    ]
+
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            for stmt in statements:
+                c.execute(stmt)
+
+            # Seed default chat rooms if empty
+            c.execute("SELECT COUNT(*) as cnt FROM chat_rooms")
+            row = c.fetchone()
+            if row["cnt"] == 0:
+                rooms = [
+                    ("🌍 General Lounge",    "Talk about anything study-related",     "general"),
+                    ("🔬 Science Hub",        "Physics, Chemistry, Biology discussions","subject"),
+                    ("📐 Maths Corner",       "From calculus to trigonometry",          "subject"),
+                    ("📖 Literature Lounge",  "Books, essays, writing tips",            "subject"),
+                    ("💻 Tech & Code",        "Programming, CS, AI",                   "subject"),
+                    ("🏛 History & Arts",     "History, geography, fine arts",          "subject"),
+                    ("🎯 Exam Prep Zone",     "Tips, tricks, past papers",              "general"),
+                    ("🤝 Study Buddy Finder", "Find accountability partners",           "general"),
+                    ("👩‍🏫 Teachers' Room",  "Pedagogy, lesson plans, resources",      "general"),
+                    ("👨‍👩‍👧 Parents Corner","Support your child's education",         "general"),
+                ]
+                for name, desc, rtype in rooms:
+                    c.execute(
+                        "INSERT INTO chat_rooms(name,description,room_type,created_by,created_at)"
+                        " VALUES(%s,%s,%s,0,%s)",
+                        (name, desc, rtype, datetime.now().strftime("%Y-%m-%d %H:%M"))
+                    )
 
 # ── APP ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="StudyNest API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=["*"],     # Tighten this to your Render URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return FileResponse("index.html")
-
 executor = ThreadPoolExecutor(max_workers=4)
+
+# Init DB on startup
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
 # ── WEBSOCKET MANAGER ─────────────────────────────────────────────────────────
 class ConnectionManager:
@@ -153,151 +329,6 @@ class ConnectionManager:
         return len(self.connections.get(room_id, []))
 
 manager = ConnectionManager()
-
-# ── DATABASE ──────────────────────────────────────────────────────────────────
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_conn(); c = conn.cursor()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        email TEXT
-    );
-    CREATE TABLE IF NOT EXISTS study_sessions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, subject TEXT, date TEXT, minutes INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS subjects_total(
-        subject TEXT, user_id INTEGER, total_minutes INTEGER DEFAULT 0,
-        PRIMARY KEY (subject, user_id)
-    );
-    CREATE TABLE IF NOT EXISTS user_stats(
-        id INTEGER PRIMARY KEY,
-        xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1, daily_goal INTEGER DEFAULT 180
-    );
-    CREATE TABLE IF NOT EXISTS subjects_meta(
-        user_id INTEGER, subject TEXT,
-        difficulty TEXT DEFAULT 'Medium', last_test_score REAL DEFAULT 0,
-        PRIMARY KEY (user_id, subject)
-    );
-    CREATE TABLE IF NOT EXISTS tasks(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, task TEXT, subject TEXT, date TEXT,
-        priority TEXT DEFAULT 'Medium', completed TEXT DEFAULT 'No',
-        completed_date TEXT
-    );
-    CREATE TABLE IF NOT EXISTS subject_notes(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, subject TEXT, note TEXT, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS reset_tokens(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, token TEXT, expires_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS user_profiles(
-        user_id INTEGER PRIMARY KEY,
-        bio TEXT DEFAULT '',
-        avatar_emoji TEXT DEFAULT '🎓',
-        role TEXT DEFAULT 'student',
-        fields_of_study TEXT DEFAULT '[]',
-        country TEXT DEFAULT '',
-        school TEXT DEFAULT '',
-        grade TEXT DEFAULT '',
-        website TEXT DEFAULT '',
-        is_public INTEGER DEFAULT 1,
-        joined_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS follows(
-        follower_id INTEGER,
-        followed_id INTEGER,
-        created_at TEXT,
-        PRIMARY KEY(follower_id, followed_id)
-    );
-    CREATE TABLE IF NOT EXISTS community_posts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        content TEXT,
-        subject_tag TEXT DEFAULT '',
-        post_type TEXT DEFAULT 'general',
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS post_likes(
-        post_id INTEGER,
-        user_id INTEGER,
-        PRIMARY KEY(post_id, user_id)
-    );
-    CREATE TABLE IF NOT EXISTS post_comments(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        post_id INTEGER,
-        user_id INTEGER,
-        comment TEXT,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS chat_rooms(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        description TEXT DEFAULT '',
-        room_type TEXT DEFAULT 'subject',
-        created_by INTEGER,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS room_members(
-        room_id INTEGER,
-        user_id INTEGER,
-        joined_at TEXT,
-        PRIMARY KEY(room_id, user_id)
-    );
-    CREATE TABLE IF NOT EXISTS room_messages(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        room_id INTEGER,
-        user_id INTEGER,
-        message TEXT,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS monitored_users(
-        monitor_id INTEGER,
-        student_id INTEGER,
-        relationship TEXT DEFAULT 'teacher',
-        created_at TEXT,
-        PRIMARY KEY(monitor_id, student_id)
-    );
-    CREATE TABLE IF NOT EXISTS chatbot_history(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        role TEXT,
-        content TEXT,
-        created_at TEXT
-    );
-    """)
-
-    # Seed default rooms
-    c.execute("SELECT COUNT(*) as cnt FROM chat_rooms")
-    if c.fetchone()["cnt"] == 0:
-        rooms = [
-            ("🌍 General Lounge", "Talk about anything study-related", "general"),
-            ("🔬 Science Hub", "Physics, Chemistry, Biology discussions", "subject"),
-            ("📐 Maths Corner", "From calculus to trigonometry", "subject"),
-            ("📖 Literature Lounge", "Books, essays, writing tips", "subject"),
-            ("💻 Tech & Code", "Programming, CS, AI", "subject"),
-            ("🏛 History & Arts", "History, geography, fine arts", "subject"),
-            ("🎯 Exam Prep Zone", "Tips, tricks, past papers", "general"),
-            ("🤝 Study Buddy Finder", "Find accountability partners", "general"),
-            ("👩‍🏫 Teachers' Room", "Pedagogy, lesson plans, resources", "general"),
-            ("👨‍👩‍👧 Parents Corner", "Support your child's education", "general"),
-        ]
-        for name, desc, rtype in rooms:
-            c.execute("INSERT INTO chat_rooms(name,description,room_type,created_by,created_at) VALUES(?,?,?,0,?)",
-                      (name, desc, rtype, datetime.now().strftime("%Y-%m-%d %H:%M")))
-
-    conn.commit(); conn.close()
-
-init_db()
 
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
 def hash_pw(p: str) -> str:
@@ -413,8 +444,7 @@ def run_ml(uid: int, study_log: dict, subjects_meta: dict):
         km = KMeans(n_clusters=nc, random_state=42, n_init=10)
         df["behaviour_cluster"] = km.fit_predict(cf)
         cluster_result = int(df["behaviour_cluster"].iloc[-1])
-    except Exception:
-        pass
+    except Exception: pass
 
     saved_model, meta = load_model(uid)
     best_model, best_mae, best_features = None, float("inf"), list(X.columns)
@@ -540,7 +570,18 @@ class MonitorReq(BaseModel):
 
 class ChatbotReq(BaseModel):
     message: str
-    history: Optional[List[dict]] = []
+    history: Optional[List[dict]] = None
+
+
+def parse_fields_of_study(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return []
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH
@@ -549,26 +590,34 @@ class ChatbotReq(BaseModel):
 def register(req: RegisterReq):
     if len(req.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-    conn = get_conn(); c = conn.cursor()
     try:
-        c.execute("INSERT INTO users(username,email,password_hash) VALUES(?,?,?)",
-                  (req.username.strip(), req.email.strip(), hash_pw(req.password)))
-        uid = c.lastrowid
-        c.execute("INSERT OR IGNORE INTO user_stats(id,xp,level,daily_goal) VALUES(?,0,1,180)", (uid,))
-        c.execute("INSERT OR IGNORE INTO user_profiles(user_id,joined_at) VALUES(?,?)",
-                  (uid, datetime.now().strftime("%Y-%m-%d")))
-        conn.commit()
+        with get_conn() as conn:
+            with get_cursor(conn) as c:
+                c.execute(
+                    "INSERT INTO users(username,email,password_hash) VALUES(%s,%s,%s) RETURNING id",
+                    (req.username.strip(), req.email.strip(), hash_pw(req.password))
+                )
+                uid = c.fetchone()["id"]
+                c.execute(
+                    "INSERT INTO user_stats(id,xp,level,daily_goal) VALUES(%s,0,1,180) ON CONFLICT DO NOTHING",
+                    (uid,)
+                )
+                c.execute(
+                    "INSERT INTO user_profiles(user_id,joined_at) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                    (uid, datetime.now().strftime("%Y-%m-%d"))
+                )
         return {"message": "Account created! Welcome to StudyNest."}
-    except sqlite3.IntegrityError:
-        raise HTTPException(400, "Username already taken")
-    finally:
-        conn.close()
+    except Exception as e:
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            raise HTTPException(400, "Username already taken")
+        raise HTTPException(500, str(e))
 
 @app.post("/api/auth/login")
 def login(req: LoginReq, response: Response):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT id, password_hash FROM users WHERE username=?", (req.username,))
-    row = c.fetchone(); conn.close()
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT id, password_hash FROM users WHERE username=%s", (req.username,))
+            row = c.fetchone()
     if not row or row["password_hash"] != hash_pw(req.password):
         raise HTTPException(401, "Invalid credentials")
     token = create_token(row["id"])
@@ -584,15 +633,15 @@ def logout(response: Response):
 @app.get("/api/auth/me")
 def me(request: Request):
     uid = get_user(request)
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT username, email FROM users WHERE id=?", (uid,))
-    row = c.fetchone(); conn.close()
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT username, email FROM users WHERE id=%s", (uid,))
+            row = c.fetchone()
     if not row: raise HTTPException(404, "User not found")
     return {"user_id": uid, "username": row["username"], "email": row["email"] or ""}
 
 @app.get("/api/auth/ws-token")
 def get_ws_token(request: Request):
-    """Short-lived token for WebSocket auth (accessible from JS)."""
     uid = get_user(request)
     return {"token": create_token(uid, minutes=5)}
 
@@ -602,29 +651,38 @@ def get_ws_token(request: Request):
 @app.get("/api/stats")
 def get_stats(request: Request):
     uid = get_user(request)
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT xp, level, daily_goal FROM user_stats WHERE id=?", (uid,))
-    row = c.fetchone()
-    if not row:
-        c.execute("INSERT OR IGNORE INTO user_stats(id,xp,level,daily_goal) VALUES(?,0,1,180)", (uid,))
-        conn.commit(); xp, level, daily_goal = 0, 1, 180
-    else:
-        xp, level, daily_goal = row["xp"], row["level"], row["daily_goal"]
-    c.execute("SELECT subject, total_minutes FROM subjects_total WHERE user_id=?", (uid,))
-    subjects = {r["subject"]: r["total_minutes"] for r in c.fetchall()}
-    c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=?", (uid,))
-    study_log: dict = {}
-    for r in c.fetchall():
-        study_log.setdefault(r["subject"], {})
-        study_log[r["subject"]][r["date"]] = study_log[r["subject"]].get(r["date"], 0) + r["minutes"]
-    c.execute("SELECT subject, difficulty, last_test_score FROM subjects_meta WHERE user_id=?", (uid,))
-    subjects_meta = {r["subject"]: {"difficulty": r["difficulty"], "score": r["last_test_score"]}
-                     for r in c.fetchall()}
-    conn.close()
-    today      = date.today().strftime("%d-%m-%Y")
-    total_today= sum(study_log.get(s, {}).get(today, 0) for s in study_log)
-    streak     = compute_streak(study_log)
-    week_total = sum(
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT xp, level, daily_goal FROM user_stats WHERE id=%s", (uid,))
+            row = c.fetchone()
+            if not row:
+                c.execute(
+                    "INSERT INTO user_stats(id,xp,level,daily_goal) VALUES(%s,0,1,180) ON CONFLICT DO NOTHING",
+                    (uid,)
+                )
+                xp, level, daily_goal = 0, 1, 180
+            else:
+                xp, level, daily_goal = row["xp"], row["level"], row["daily_goal"]
+
+            c.execute("SELECT subject, total_minutes FROM subjects_total WHERE user_id=%s", (uid,))
+            subjects = {r["subject"]: r["total_minutes"] for r in c.fetchall()}
+
+            c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=%s", (uid,))
+            study_log: dict = {}
+            for r in c.fetchall():
+                study_log.setdefault(r["subject"], {})
+                study_log[r["subject"]][r["date"]] = study_log[r["subject"]].get(r["date"], 0) + r["minutes"]
+
+            c.execute("SELECT subject, difficulty, last_test_score FROM subjects_meta WHERE user_id=%s", (uid,))
+            subjects_meta = {
+                r["subject"]: {"difficulty": r["difficulty"], "score": r["last_test_score"]}
+                for r in c.fetchall()
+            }
+
+    today       = date.today().strftime("%d-%m-%Y")
+    total_today = sum(study_log.get(s, {}).get(today, 0) for s in study_log)
+    streak      = compute_streak(study_log)
+    week_total  = sum(
         study_log.get(s, {}).get((date.today() - timedelta(days=i)).strftime("%d-%m-%Y"), 0)
         for s in study_log for i in range(7)
     )
@@ -632,9 +690,11 @@ def get_stats(request: Request):
     for i in range(6,-1,-1):
         d = (date.today()-timedelta(days=i)).strftime("%d-%m-%Y")
         week_vals.append(sum(study_log.get(s,{}).get(d,0) for s in study_log))
+
     recent = sum(week_vals[4:])/3 if sum(week_vals[4:]) else 0
     older  = sum(week_vals[:4])/4 if sum(week_vals[:4]) else 0
     momentum = 0 if (older==0 and recent==0) else 200 if older==0 else min(int(recent/older*100),200)
+
     return {
         "xp": xp, "level": level, "daily_goal": daily_goal,
         "total_today": total_today, "streak": streak,
@@ -649,79 +709,104 @@ def get_stats(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/api/subjects")
 def add_subject(req: SubjectReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO subjects_total(subject,user_id,total_minutes) VALUES(?,?,0)",
-              (req.name.strip(), uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO subjects_total(subject,user_id,total_minutes) VALUES(%s,%s,0) ON CONFLICT DO NOTHING",
+                (req.name.strip(), uid)
+            )
     return {"message": f"Subject '{req.name}' added"}
 
 @app.delete("/api/subjects/{subject}")
 def delete_subject(subject: str, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM subjects_total WHERE subject=? AND user_id=?", (subject, uid))
-    c.execute("DELETE FROM study_sessions WHERE subject=? AND user_id=?", (subject, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM subjects_total WHERE subject=%s AND user_id=%s", (subject, uid))
+            c.execute("DELETE FROM study_sessions WHERE subject=%s AND user_id=%s", (subject, uid))
     return {"message": f"Subject '{subject}' deleted"}
 
 @app.post("/api/sessions")
 def log_session(req: SessionReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO study_sessions(user_id,subject,date,minutes) VALUES(?,?,?,?)",
-              (uid, req.subject, req.date, req.minutes))
-    c.execute("INSERT OR IGNORE INTO subjects_total(subject,user_id,total_minutes) VALUES(?,?,0)",
-              (req.subject, uid))
-    c.execute("UPDATE subjects_total SET total_minutes=total_minutes+? WHERE subject=? AND user_id=?",
-              (req.minutes, req.subject, uid))
-    c.execute("SELECT xp, level FROM user_stats WHERE id=?", (uid,))
-    row = c.fetchone()
-    if row:
-        xp = row["xp"] + req.minutes//5; level = row["level"]
-        if xp >= level * 100: level += 1
-        c.execute("UPDATE user_stats SET xp=?, level=? WHERE id=?", (xp, level, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO study_sessions(user_id,subject,date,minutes) VALUES(%s,%s,%s,%s)",
+                (uid, req.subject, req.date, req.minutes)
+            )
+            c.execute(
+                "INSERT INTO subjects_total(subject,user_id,total_minutes) VALUES(%s,%s,0) ON CONFLICT DO NOTHING",
+                (req.subject, uid)
+            )
+            c.execute(
+                "UPDATE subjects_total SET total_minutes=total_minutes+%s WHERE subject=%s AND user_id=%s",
+                (req.minutes, req.subject, uid)
+            )
+            c.execute("SELECT xp, level FROM user_stats WHERE id=%s", (uid,))
+            row = c.fetchone()
+            if row:
+                xp = row["xp"] + req.minutes//5; level = row["level"]
+                if xp >= level * 100: level += 1
+                c.execute("UPDATE user_stats SET xp=%s, level=%s WHERE id=%s", (xp, level, uid))
     return {"message": "Session logged", "xp_gained": req.minutes//5}
 
 @app.delete("/api/sessions/undo")
 def undo_session(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT rowid, subject, minutes, date FROM study_sessions
-                 WHERE user_id=? ORDER BY rowid DESC LIMIT 1""", (uid,))
-    row = c.fetchone()
-    if not row: raise HTTPException(404, "Nothing to undo")
-    info = dict(row)
-    c.execute("DELETE FROM study_sessions WHERE rowid=?", (row["rowid"],))
-    c.execute("UPDATE subjects_total SET total_minutes=MAX(0,total_minutes-?) WHERE subject=? AND user_id=?",
-              (row["minutes"], row["subject"], uid))
-    c.execute("UPDATE user_stats SET xp=MAX(0,xp-?) WHERE id=?", (row["minutes"]//5, uid))
-    conn.commit(); conn.close()
-    return {"message": f"Undone: {info['subject']} — {info['minutes']} min on {info['date']}",
-            "undone": info}
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "SELECT id, subject, minutes, date FROM study_sessions WHERE user_id=%s ORDER BY id DESC LIMIT 1",
+                (uid,)
+            )
+            row = c.fetchone()
+            if not row: raise HTTPException(404, "Nothing to undo")
+            info = dict(row)
+            c.execute("DELETE FROM study_sessions WHERE id=%s", (row["id"],))
+            c.execute(
+                "UPDATE subjects_total SET total_minutes=GREATEST(0,total_minutes-%s) WHERE subject=%s AND user_id=%s",
+                (row["minutes"], row["subject"], uid)
+            )
+            c.execute(
+                "UPDATE user_stats SET xp=GREATEST(0,xp-%s) WHERE id=%s",
+                (row["minutes"]//5, uid)
+            )
+    return {
+        "message": f"Undone: {info['subject']} — {info['minutes']} min on {info['date']}",
+        "undone": info
+    }
 
 @app.get("/api/sessions/last")
 def get_last_session(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT subject, minutes, date FROM study_sessions
-                 WHERE user_id=? ORDER BY rowid DESC LIMIT 1""", (uid,))
-    row = c.fetchone(); conn.close()
-    if not row: return {"last": None}
-    return {"last": dict(row)}
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "SELECT subject, minutes, date FROM study_sessions WHERE user_id=%s ORDER BY id DESC LIMIT 1",
+                (uid,)
+            )
+            row = c.fetchone()
+    return {"last": dict(row) if row else None}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ML PREDICT
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/predict")
 async def predict(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=?", (uid,))
-    study_log: dict = {}
-    for r in c.fetchall():
-        study_log.setdefault(r["subject"], {})
-        study_log[r["subject"]][r["date"]] = study_log[r["subject"]].get(r["date"], 0) + r["minutes"]
-    c.execute("SELECT subject, difficulty, last_test_score FROM subjects_meta WHERE user_id=?", (uid,))
-    subjects_meta = {r["subject"]: {"difficulty": r["difficulty"], "score": r["last_test_score"]}
-                     for r in c.fetchall()}
-    conn.close()
-    loop   = asyncio.get_event_loop()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=%s", (uid,))
+            study_log: dict = {}
+            for r in c.fetchall():
+                study_log.setdefault(r["subject"], {})
+                study_log[r["subject"]][r["date"]] = study_log[r["subject"]].get(r["date"], 0) + r["minutes"]
+            c.execute("SELECT subject, difficulty, last_test_score FROM subjects_meta WHERE user_id=%s", (uid,))
+            subjects_meta = {r["subject"]: {"difficulty": r["difficulty"], "score": r["last_test_score"]}
+                             for r in c.fetchall()}
+    loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, run_ml, uid, study_log, subjects_meta)
     if result is None:
         return {"error": "Need 7+ sessions for prediction", "tomorrow": None}
@@ -732,44 +817,58 @@ async def predict(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/tasks")
 def get_tasks(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT id,task,subject,date,priority,completed,completed_date FROM tasks
-                 WHERE user_id=? ORDER BY
-                 CASE priority WHEN 'Urgent' THEN 1 WHEN 'High' THEN 2
-                 WHEN 'Medium' THEN 3 ELSE 4 END, date ASC""", (uid,))
-    tasks = [dict(r) for r in c.fetchall()]
-    c.execute("SELECT id, completed_date FROM tasks WHERE completed='Yes' AND user_id=?", (uid,))
-    for r in c.fetchall():
-        if r["completed_date"]:
-            try:
-                cd = datetime.strptime(r["completed_date"], "%Y-%m-%d").date()
-                if (date.today() - cd).days >= 1:
-                    c.execute("DELETE FROM tasks WHERE id=?", (r["id"],))
-            except Exception: pass
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT id,task,subject,date,priority,completed,completed_date FROM tasks
+                WHERE user_id=%s
+                ORDER BY CASE priority WHEN 'Urgent' THEN 1 WHEN 'High' THEN 2
+                         WHEN 'Medium' THEN 3 ELSE 4 END, date ASC
+            """, (uid,))
+            tasks = [dict(r) for r in c.fetchall()]
+
+            # Auto-clean completed > 1 day old
+            c.execute(
+                "SELECT id, completed_date FROM tasks WHERE completed='Yes' AND user_id=%s", (uid,)
+            )
+            for r in c.fetchall():
+                if r["completed_date"]:
+                    try:
+                        cd = datetime.strptime(r["completed_date"], "%Y-%m-%d").date()
+                        if (date.today() - cd).days >= 1:
+                            c.execute("DELETE FROM tasks WHERE id=%s", (r["id"],))
+                    except Exception: pass
     return tasks
 
 @app.post("/api/tasks")
 def add_task(req: TaskReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO tasks(user_id,task,subject,date,priority,completed) VALUES(?,?,?,?,?,?)",
-              (uid, req.task.strip(), req.subject, req.date, req.priority, "No"))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO tasks(user_id,task,subject,date,priority,completed) VALUES(%s,%s,%s,%s,%s,%s)",
+                (uid, req.task.strip(), req.subject, req.date, req.priority, "No")
+            )
     return {"message": "Task added"}
 
 @app.put("/api/tasks/{task_id}/complete")
 def complete_task(task_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("UPDATE tasks SET completed='Yes', completed_date=? WHERE id=? AND user_id=?",
-              (str(date.today()), task_id, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "UPDATE tasks SET completed='Yes', completed_date=%s WHERE id=%s AND user_id=%s",
+                (str(date.today()), task_id, uid)
+            )
     return {"message": "Task completed"}
 
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM tasks WHERE id=? AND user_id=?", (task_id, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM tasks WHERE id=%s AND user_id=%s", (task_id, uid))
     return {"message": "Task deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -777,25 +876,32 @@ def delete_task(task_id: int, request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/notes/{subject}")
 def get_notes(subject: str, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT id, note, created_at FROM subject_notes WHERE user_id=? AND subject=? ORDER BY id DESC",
-              (uid, subject))
-    notes = [dict(r) for r in c.fetchall()]; conn.close()
-    return notes
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "SELECT id, note, created_at FROM subject_notes WHERE user_id=%s AND subject=%s ORDER BY id DESC",
+                (uid, subject)
+            )
+            return [dict(r) for r in c.fetchall()]
 
 @app.post("/api/notes")
 def add_note(req: NoteReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO subject_notes(user_id,subject,note,created_at) VALUES(?,?,?,?)",
-              (uid, req.subject, req.note.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO subject_notes(user_id,subject,note,created_at) VALUES(%s,%s,%s,%s)",
+                (uid, req.subject, req.note.strip(), datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
     return {"message": "Note saved"}
 
 @app.delete("/api/notes/{note_id}")
 def delete_note(note_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM subject_notes WHERE id=? AND user_id=?", (note_id, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM subject_notes WHERE id=%s AND user_id=%s", (note_id, uid))
     return {"message": "Note deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -803,58 +909,62 @@ def delete_note(note_id: int, request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.put("/api/account/goal")
 def set_goal(req: GoalReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("UPDATE user_stats SET daily_goal=? WHERE id=?", (req.daily_goal, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("UPDATE user_stats SET daily_goal=%s WHERE id=%s", (req.daily_goal, uid))
     return {"message": "Goal updated"}
 
 @app.post("/api/account/preferences")
 def save_prefs(req: PrefReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""INSERT INTO subjects_meta(user_id,subject,difficulty,last_test_score) VALUES(?,?,?,?)
-                 ON CONFLICT(user_id,subject) DO UPDATE SET
-                 difficulty=excluded.difficulty, last_test_score=excluded.last_test_score""",
-              (uid, req.subject, req.difficulty, req.score))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                INSERT INTO subjects_meta(user_id,subject,difficulty,last_test_score) VALUES(%s,%s,%s,%s)
+                ON CONFLICT(user_id,subject) DO UPDATE SET
+                difficulty=EXCLUDED.difficulty, last_test_score=EXCLUDED.last_test_score
+            """, (uid, req.subject, req.difficulty, req.score))
     return {"message": "Preferences saved"}
 
 @app.delete("/api/account/reset")
 def reset_history(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM subjects_total WHERE user_id=?", (uid,))
-    c.execute("DELETE FROM study_sessions WHERE user_id=?", (uid,))
-    c.execute("UPDATE user_stats SET xp=0,level=1 WHERE id=?", (uid,))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM subjects_total WHERE user_id=%s", (uid,))
+            c.execute("DELETE FROM study_sessions WHERE user_id=%s", (uid,))
+            c.execute("UPDATE user_stats SET xp=0,level=1 WHERE id=%s", (uid,))
     return {"message": "History reset"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROFILE
 # ══════════════════════════════════════════════════════════════════════════════
-def _get_profile_full(uid: int, viewer_id: int, conn):
-    c = conn.cursor()
-    c.execute("SELECT * FROM user_profiles WHERE user_id=?", (uid,))
-    p = c.fetchone()
-    c.execute("SELECT username, email FROM users WHERE id=?", (uid,))
-    u = c.fetchone()
-    c.execute("SELECT xp, level FROM user_stats WHERE id=?", (uid,))
-    st = c.fetchone()
-    c.execute("SELECT COUNT(*) as cnt FROM follows WHERE followed_id=?", (uid,))
-    followers = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM follows WHERE follower_id=?", (uid,))
-    following = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM follows WHERE follower_id=? AND followed_id=?",
-              (viewer_id, uid))
-    is_following = bool(c.fetchone()["cnt"])
-    c.execute("SELECT subject, total_minutes FROM subjects_total WHERE user_id=? ORDER BY total_minutes DESC LIMIT 5", (uid,))
-    top_subjects = [dict(r) for r in c.fetchall()]
-    # Compute streak
-    c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=?", (uid,))
-    sl: dict = {}
-    for r in c.fetchall():
-        sl.setdefault(r["subject"], {})
-        sl[r["subject"]][r["date"]] = sl[r["subject"]].get(r["date"], 0) + r["minutes"]
-    streak = compute_streak(sl)
-    total_mins = sum(v for subj in sl.values() for v in subj.values())
+def _get_profile_full(uid: int, viewer_id: int):
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT * FROM user_profiles WHERE user_id=%s", (uid,))
+            p = c.fetchone()
+            c.execute("SELECT username, email FROM users WHERE id=%s", (uid,))
+            u = c.fetchone()
+            c.execute("SELECT xp, level FROM user_stats WHERE id=%s", (uid,))
+            st = c.fetchone()
+            c.execute("SELECT COUNT(*) as cnt FROM follows WHERE followed_id=%s", (uid,))
+            followers = c.fetchone()["cnt"]
+            c.execute("SELECT COUNT(*) as cnt FROM follows WHERE follower_id=%s", (uid,))
+            following = c.fetchone()["cnt"]
+            c.execute("SELECT COUNT(*) as cnt FROM follows WHERE follower_id=%s AND followed_id=%s",
+                      (viewer_id, uid))
+            is_following = bool(c.fetchone()["cnt"])
+            c.execute("SELECT subject, total_minutes FROM subjects_total WHERE user_id=%s ORDER BY total_minutes DESC LIMIT 5", (uid,))
+            top_subjects = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=%s", (uid,))
+            sl: dict = {}
+            for r in c.fetchall():
+                sl.setdefault(r["subject"], {})
+                sl[r["subject"]][r["date"]] = sl[r["subject"]].get(r["date"], 0) + r["minutes"]
+            streak = compute_streak(sl)
+            total_mins = sum(v for subj in sl.values() for v in subj.values())
 
     return {
         "user_id": uid,
@@ -862,7 +972,7 @@ def _get_profile_full(uid: int, viewer_id: int, conn):
         "bio": p["bio"] if p else "",
         "avatar_emoji": p["avatar_emoji"] if p else "🎓",
         "role": p["role"] if p else "student",
-        "fields_of_study": json.loads(p["fields_of_study"]) if p and p["fields_of_study"] else [],
+        "fields_of_study": parse_fields_of_study(p["fields_of_study"]) if p else [],
         "country": p["country"] if p else "",
         "school": p["school"] if p else "",
         "grade": p["grade"] if p else "",
@@ -881,51 +991,53 @@ def _get_profile_full(uid: int, viewer_id: int, conn):
 
 @app.get("/api/profile")
 def get_my_profile(request: Request):
-    uid = get_user(request); conn = get_conn()
-    result = _get_profile_full(uid, uid, conn); conn.close()
-    return result
+    uid = get_user(request)
+    return _get_profile_full(uid, uid)
 
 @app.put("/api/profile")
 def update_profile(req: ProfileReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""INSERT INTO user_profiles(user_id,bio,avatar_emoji,role,fields_of_study,country,school,grade,website,is_public,joined_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                 ON CONFLICT(user_id) DO UPDATE SET
-                 bio=excluded.bio, avatar_emoji=excluded.avatar_emoji,
-                 role=excluded.role, fields_of_study=excluded.fields_of_study,
-                 country=excluded.country, school=excluded.school,
-                 grade=excluded.grade, website=excluded.website,
-                 is_public=excluded.is_public""",
-              (uid, req.bio, req.avatar_emoji, req.role,
-               req.fields_of_study if isinstance(req.fields_of_study, str) else json.dumps(req.fields_of_study),
-               req.country, req.school, req.grade, req.website, req.is_public,
-               date.today().strftime("%Y-%m-%d")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                INSERT INTO user_profiles(user_id,bio,avatar_emoji,role,fields_of_study,country,school,grade,website,is_public,joined_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(user_id) DO UPDATE SET
+                bio=EXCLUDED.bio, avatar_emoji=EXCLUDED.avatar_emoji,
+                role=EXCLUDED.role, fields_of_study=EXCLUDED.fields_of_study,
+                country=EXCLUDED.country, school=EXCLUDED.school,
+                grade=EXCLUDED.grade, website=EXCLUDED.website,
+                is_public=EXCLUDED.is_public
+            """, (uid, req.bio, req.avatar_emoji, req.role,
+                  req.fields_of_study if isinstance(req.fields_of_study, str) else json.dumps(req.fields_of_study),
+                  req.country, req.school, req.grade, req.website, req.is_public,
+                  date.today().strftime("%Y-%m-%d")))
     return {"message": "Profile updated"}
 
 @app.get("/api/profile/{uid}")
 def get_user_profile(uid: int, request: Request):
-    viewer = get_user(request); conn = get_conn()
-    result = _get_profile_full(uid, viewer, conn); conn.close()
-    return result
+    viewer = get_user(request)
+    return _get_profile_full(uid, viewer)
 
 @app.get("/api/users/search")
 def search_users(q: str, request: Request):
-    me = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT u.id, u.username, p.avatar_emoji, p.role, p.fields_of_study, p.country
-                 FROM users u LEFT JOIN user_profiles p ON u.id=p.user_id
-                 WHERE u.username LIKE ? AND u.id != ? LIMIT 20""",
-              (f"%{q}%", me))
-    rows = []
-    for r in c.fetchall():
-        rows.append({
-            "user_id": r["id"], "username": r["username"],
-            "avatar_emoji": r["avatar_emoji"] or "🎓",
-            "role": r["role"] or "student",
-            "fields": json.loads(r["fields_of_study"]) if r["fields_of_study"] else [],
-            "country": r["country"] or "",
-        })
-    conn.close()
+    me = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT u.id, u.username, p.avatar_emoji, p.role, p.fields_of_study, p.country
+                FROM users u LEFT JOIN user_profiles p ON u.id=p.user_id
+                WHERE u.username ILIKE %s AND u.id != %s LIMIT 20
+                      """, (f"%{q}%", me))
+            rows = []
+            for r in c.fetchall():
+                rows.append({
+                    "user_id": r["id"], "username": r["username"],
+                    "avatar_emoji": r["avatar_emoji"] or "🎓",
+                    "role": r["role"] or "student",
+                    "fields": parse_fields_of_study(r["fields_of_study"]),
+                    "country": r["country"] or "",
+                })
     return rows
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -935,69 +1047,80 @@ def search_users(q: str, request: Request):
 def follow_user(target_id: int, request: Request):
     uid = get_user(request)
     if uid == target_id: raise HTTPException(400, "Cannot follow yourself")
-    conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)",
-              (uid, target_id, datetime.now().strftime("%Y-%m-%d")))
-    conn.commit(); conn.close()
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO follows(follower_id,followed_id,created_at) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+                (uid, target_id, datetime.now().strftime("%Y-%m-%d"))
+            )
     return {"message": "Followed"}
 
 @app.delete("/api/follow/{target_id}")
 def unfollow_user(target_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM follows WHERE follower_id=? AND followed_id=?", (uid, target_id))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM follows WHERE follower_id=%s AND followed_id=%s", (uid, target_id))
     return {"message": "Unfollowed"}
 
 @app.get("/api/followers")
 def get_followers(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT u.id, u.username, p.avatar_emoji, p.role FROM follows f
-                 JOIN users u ON f.follower_id=u.id
-                 LEFT JOIN user_profiles p ON u.id=p.user_id
-                 WHERE f.followed_id=?""", (uid,))
-    rows = [{"user_id":r["id"],"username":r["username"],"avatar_emoji":r["avatar_emoji"] or "🎓","role":r["role"] or "student"}
-            for r in c.fetchall()]
-    conn.close(); return rows
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT u.id, u.username, p.avatar_emoji, p.role FROM follows f
+                JOIN users u ON f.follower_id=u.id
+                LEFT JOIN user_profiles p ON u.id=p.user_id
+                WHERE f.followed_id=%s
+            """, (uid,))
+            return [{"user_id":r["id"],"username":r["username"],"avatar_emoji":r["avatar_emoji"] or "🎓","role":r["role"] or "student"}
+                    for r in c.fetchall()]
 
 @app.get("/api/following")
 def get_following(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT u.id, u.username, p.avatar_emoji, p.role FROM follows f
-                 JOIN users u ON f.followed_id=u.id
-                 LEFT JOIN user_profiles p ON u.id=p.user_id
-                 WHERE f.follower_id=?""", (uid,))
-    rows = [{"user_id":r["id"],"username":r["username"],"avatar_emoji":r["avatar_emoji"] or "🎓","role":r["role"] or "student"}
-            for r in c.fetchall()]
-    conn.close(); return rows
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT u.id, u.username, p.avatar_emoji, p.role FROM follows f
+                JOIN users u ON f.followed_id=u.id
+                LEFT JOIN user_profiles p ON u.id=p.user_id
+                WHERE f.follower_id=%s
+            """, (uid,))
+            return [{"user_id":r["id"],"username":r["username"],"avatar_emoji":r["avatar_emoji"] or "🎓","role":r["role"] or "student"}
+                    for r in c.fetchall()]
 
 @app.get("/api/study-buddies")
 def get_study_buddies(request: Request):
-    """Find users with overlapping fields of study."""
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT fields_of_study FROM user_profiles WHERE user_id=?", (uid,))
-    my_row = c.fetchone()
-    my_fields = json.loads(my_row["fields_of_study"]) if my_row and my_row["fields_of_study"] else []
-    c.execute("""SELECT u.id, u.username, p.avatar_emoji, p.role, p.fields_of_study, p.country, p.school,
-                        st.xp, st.level
-                 FROM users u
-                 LEFT JOIN user_profiles p ON u.id=p.user_id
-                 LEFT JOIN user_stats st ON u.id=st.id
-                 WHERE u.id != ? AND p.is_public=1""", (uid,))
-    buddies = []
-    for r in c.fetchall():
-        their_fields = json.loads(r["fields_of_study"]) if r["fields_of_study"] else []
-        overlap = [f for f in their_fields if f in my_fields]
-        if overlap or not my_fields:
-            buddies.append({
-                "user_id": r["id"], "username": r["username"],
-                "avatar_emoji": r["avatar_emoji"] or "🎓",
-                "role": r["role"] or "student",
-                "fields": their_fields, "common": overlap,
-                "country": r["country"] or "", "school": r["school"] or "",
-                "level": r["level"] or 1,
-            })
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT fields_of_study FROM user_profiles WHERE user_id=%s", (uid,))
+            my_row = c.fetchone()
+            my_fields = parse_fields_of_study(my_row["fields_of_study"]) if my_row else []
+            c.execute("""
+                SELECT u.id, u.username, p.avatar_emoji, p.role, p.fields_of_study, p.country, p.school,
+                       st.xp, st.level
+                FROM users u
+                LEFT JOIN user_profiles p ON u.id=p.user_id
+                LEFT JOIN user_stats st ON u.id=st.id
+                WHERE u.id != %s AND p.is_public=1
+            """, (uid,))
+            buddies = []
+            for r in c.fetchall():
+                their_fields = parse_fields_of_study(r["fields_of_study"])
+                overlap = [f for f in their_fields if f in my_fields]
+                if overlap or not my_fields:
+                    buddies.append({
+                        "user_id": r["id"], "username": r["username"],
+                        "avatar_emoji": r["avatar_emoji"] or "🎓",
+                        "role": r["role"] or "student",
+                        "fields": their_fields, "common": overlap,
+                        "country": r["country"] or "", "school": r["school"] or "",
+                        "level": r["level"] or 1,
+                    })
     buddies.sort(key=lambda x: -len(x["common"]))
-    conn.close()
     return buddies[:20]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1005,70 +1128,85 @@ def get_study_buddies(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/feed")
 def get_feed(request: Request, limit: int = 30, offset: int = 0):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT p.id, p.user_id, p.content, p.subject_tag, p.post_type, p.created_at,
-                        u.username, pr.avatar_emoji,
-                        (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) as like_count,
-                        (SELECT COUNT(*) FROM post_comments pc WHERE pc.post_id=p.id) as comment_count,
-                        (SELECT COUNT(*) FROM post_likes pl2 WHERE pl2.post_id=p.id AND pl2.user_id=?) as i_liked
-                 FROM community_posts p
-                 JOIN users u ON p.user_id=u.id
-                 LEFT JOIN user_profiles pr ON p.user_id=pr.user_id
-                 ORDER BY p.id DESC LIMIT ? OFFSET ?""", (uid, limit, offset))
-    posts = [dict(r) for r in c.fetchall()]; conn.close()
-    return posts
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT p.id, p.user_id, p.content, p.subject_tag, p.post_type, p.created_at,
+                       u.username, pr.avatar_emoji,
+                       (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) as like_count,
+                       (SELECT COUNT(*) FROM post_comments pc WHERE pc.post_id=p.id) as comment_count,
+                       (SELECT COUNT(*) FROM post_likes pl2 WHERE pl2.post_id=p.id AND pl2.user_id=%s) as i_liked
+                FROM community_posts p
+                JOIN users u ON p.user_id=u.id
+                LEFT JOIN user_profiles pr ON p.user_id=pr.user_id
+                ORDER BY p.id DESC LIMIT %s OFFSET %s
+            """, (uid, limit, offset))
+            return [dict(r) for r in c.fetchall()]
 
 @app.post("/api/posts")
 def create_post(req: PostReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO community_posts(user_id,content,subject_tag,post_type,created_at) VALUES(?,?,?,?,?)",
-              (uid, req.content.strip(), req.subject_tag, req.post_type, datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO community_posts(user_id,content,subject_tag,post_type,created_at) VALUES(%s,%s,%s,%s,%s)",
+                (uid, req.content.strip(), req.subject_tag, req.post_type, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
     return {"message": "Posted!"}
 
 @app.delete("/api/posts/{post_id}")
 def delete_post(post_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM community_posts WHERE id=? AND user_id=?", (post_id, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM community_posts WHERE id=%s AND user_id=%s", (post_id, uid))
     return {"message": "Post deleted"}
 
 @app.post("/api/posts/{post_id}/like")
 def toggle_like(post_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT 1 FROM post_likes WHERE post_id=? AND user_id=?", (post_id, uid))
-    if c.fetchone():
-        c.execute("DELETE FROM post_likes WHERE post_id=? AND user_id=?", (post_id, uid))
-        liked = False
-    else:
-        c.execute("INSERT INTO post_likes(post_id,user_id) VALUES(?,?)", (post_id, uid))
-        liked = True
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT 1 FROM post_likes WHERE post_id=%s AND user_id=%s", (post_id, uid))
+            if c.fetchone():
+                c.execute("DELETE FROM post_likes WHERE post_id=%s AND user_id=%s", (post_id, uid))
+                liked = False
+            else:
+                c.execute("INSERT INTO post_likes(post_id,user_id) VALUES(%s,%s)", (post_id, uid))
+                liked = True
     return {"liked": liked}
 
 @app.get("/api/posts/{post_id}/comments")
 def get_comments(post_id: int, request: Request):
-    get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT pc.id, pc.user_id, pc.comment, pc.created_at, u.username, pr.avatar_emoji
-                 FROM post_comments pc JOIN users u ON pc.user_id=u.id
-                 LEFT JOIN user_profiles pr ON pc.user_id=pr.user_id
-                 WHERE pc.post_id=? ORDER BY pc.id ASC""", (post_id,))
-    comments = [dict(r) for r in c.fetchall()]; conn.close()
-    return comments
+    get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT pc.id, pc.user_id, pc.comment, pc.created_at, u.username, pr.avatar_emoji
+                FROM post_comments pc JOIN users u ON pc.user_id=u.id
+                LEFT JOIN user_profiles pr ON pc.user_id=pr.user_id
+                WHERE pc.post_id=%s ORDER BY pc.id ASC
+            """, (post_id,))
+            return [dict(r) for r in c.fetchall()]
 
 @app.post("/api/posts/{post_id}/comments")
 def add_comment(post_id: int, req: CommentReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO post_comments(post_id,user_id,comment,created_at) VALUES(?,?,?,?)",
-              (post_id, uid, req.comment.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO post_comments(post_id,user_id,comment,created_at) VALUES(%s,%s,%s,%s)",
+                (post_id, uid, req.comment.strip(), datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
     return {"message": "Comment added"}
 
 @app.delete("/api/posts/{post_id}/comments/{cid}")
 def delete_comment(post_id: int, cid: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM post_comments WHERE id=? AND user_id=?", (cid, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM post_comments WHERE id=%s AND user_id=%s", (cid, uid))
     return {"message": "Comment deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1076,70 +1214,86 @@ def delete_comment(post_id: int, cid: int, request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/rooms")
 def get_rooms(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT r.id, r.name, r.description, r.room_type,
-                        (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id=r.id) as member_count,
-                        (SELECT COUNT(*) FROM room_messages rm WHERE rm.room_id=r.id) as msg_count,
-                        (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id=r.id AND rm.user_id=?) as is_member
-                 FROM chat_rooms r ORDER BY r.id ASC""", (uid,))
-    rooms = [dict(r) for r in c.fetchall()]; conn.close()
-    return rooms
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT r.id, r.name, r.description, r.room_type,
+                       (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id=r.id) as member_count,
+                       (SELECT COUNT(*) FROM room_messages rm WHERE rm.room_id=r.id) as msg_count,
+                       (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id=r.id AND rm.user_id=%s) as is_member
+                FROM chat_rooms r ORDER BY r.id ASC
+            """, (uid,))
+            return [dict(r) for r in c.fetchall()]
 
 @app.post("/api/rooms")
 def create_room(req: RoomReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO chat_rooms(name,description,room_type,created_by,created_at) VALUES(?,?,?,?,?)",
-              (req.name.strip(), req.description, req.room_type, uid, datetime.now().strftime("%Y-%m-%d %H:%M")))
-    rid = c.lastrowid
-    c.execute("INSERT OR IGNORE INTO room_members(room_id,user_id,joined_at) VALUES(?,?,?)",
-              (rid, uid, datetime.now().strftime("%Y-%m-%d")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO chat_rooms(name,description,room_type,created_by,created_at) VALUES(%s,%s,%s,%s,%s) RETURNING id",
+                (req.name.strip(), req.description, req.room_type, uid, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
+            rid = c.fetchone()["id"]
+            c.execute(
+                "INSERT INTO room_members(room_id,user_id,joined_at) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+                (rid, uid, datetime.now().strftime("%Y-%m-%d"))
+            )
     return {"message": "Room created", "room_id": rid}
 
 @app.post("/api/rooms/{room_id}/join")
 def join_room(room_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO room_members(room_id,user_id,joined_at) VALUES(?,?,?)",
-              (room_id, uid, datetime.now().strftime("%Y-%m-%d")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO room_members(room_id,user_id,joined_at) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+                (room_id, uid, datetime.now().strftime("%Y-%m-%d"))
+            )
     return {"message": "Joined room"}
 
 @app.delete("/api/rooms/{room_id}/leave")
 def leave_room(room_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM room_members WHERE room_id=? AND user_id=?", (room_id, uid))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM room_members WHERE room_id=%s AND user_id=%s", (room_id, uid))
     return {"message": "Left room"}
 
 @app.get("/api/rooms/{room_id}/messages")
 def get_messages(room_id: int, request: Request, since_id: int = 0):
-    get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT m.id, m.user_id, m.message, m.created_at, u.username, p.avatar_emoji
-                 FROM room_messages m JOIN users u ON m.user_id=u.id
-                 LEFT JOIN user_profiles p ON m.user_id=p.user_id
-                 WHERE m.room_id=? AND m.id>?
-                 ORDER BY m.id ASC LIMIT 100""", (room_id, since_id))
-    msgs = [dict(r) for r in c.fetchall()]; conn.close()
-    return msgs
+    get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT m.id, m.user_id, m.message, m.created_at, u.username, p.avatar_emoji
+                FROM room_messages m JOIN users u ON m.user_id=u.id
+                LEFT JOIN user_profiles p ON m.user_id=p.user_id
+                WHERE m.room_id=%s AND m.id>%s
+                ORDER BY m.id ASC LIMIT 100
+            """, (room_id, since_id))
+            return [dict(r) for r in c.fetchall()]
 
 @app.post("/api/rooms/{room_id}/messages")
 def send_message(room_id: int, req: MessageReq, request: Request):
     uid = get_user(request)
     if not req.message.strip(): raise HTTPException(400, "Empty message")
-    conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO room_messages(room_id,user_id,message,created_at) VALUES(?,?,?,?)",
-              (room_id, uid, req.message.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    mid = c.lastrowid
-    c.execute("SELECT username FROM users WHERE id=?", (uid,))
-    uname = c.fetchone()["username"]
-    c.execute("SELECT avatar_emoji FROM user_profiles WHERE user_id=?", (uid,))
-    p = c.fetchone()
-    emoji = p["avatar_emoji"] if p else "🎓"
-    conn.commit(); conn.close()
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "INSERT INTO room_messages(room_id,user_id,message,created_at) VALUES(%s,%s,%s,%s) RETURNING id",
+                (room_id, uid, req.message.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            mid = c.fetchone()["id"]
+            c.execute("SELECT username FROM users WHERE id=%s", (uid,))
+            uname = c.fetchone()["username"]
+            c.execute("SELECT avatar_emoji FROM user_profiles WHERE user_id=%s", (uid,))
+            p = c.fetchone()
+            emoji = p["avatar_emoji"] if p else "🎓"
     return {"id": mid, "user_id": uid, "username": uname, "avatar_emoji": emoji,
             "message": req.message.strip(), "created_at": datetime.now().strftime("%H:%M")}
 
-# WebSocket endpoint
 @app.websocket("/ws/room/{room_id}")
 async def ws_room(websocket: WebSocket, room_id: int):
     token = websocket.query_params.get("token")
@@ -1147,11 +1301,12 @@ async def ws_room(websocket: WebSocket, room_id: int):
     if not uid:
         await websocket.close(code=1008); return
 
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT username FROM users WHERE id=?", (uid,))
-    u = c.fetchone()
-    c.execute("SELECT avatar_emoji FROM user_profiles WHERE user_id=?", (uid,))
-    p = c.fetchone(); conn.close()
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT username FROM users WHERE id=%s", (uid,))
+            u = c.fetchone()
+            c.execute("SELECT avatar_emoji FROM user_profiles WHERE user_id=%s", (uid,))
+            p = c.fetchone()
     uname = u["username"] if u else "User"
     emoji = p["avatar_emoji"] if p else "🎓"
 
@@ -1163,10 +1318,13 @@ async def ws_room(websocket: WebSocket, room_id: int):
             data = await websocket.receive_json()
             msg = data.get("message", "").strip()
             if not msg: continue
-            conn2 = get_conn(); c2 = conn2.cursor()
-            c2.execute("INSERT INTO room_messages(room_id,user_id,message,created_at) VALUES(?,?,?,?)",
-                       (room_id, uid, msg, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-            mid = c2.lastrowid; conn2.commit(); conn2.close()
+            with get_conn() as conn2:
+                with get_cursor(conn2) as c2:
+                    c2.execute(
+                        "INSERT INTO room_messages(room_id,user_id,message,created_at) VALUES(%s,%s,%s,%s) RETURNING id",
+                        (room_id, uid, msg, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    )
+                    mid = c2.fetchone()["id"]
             await manager.broadcast(room_id, {
                 "type": "message", "id": mid, "user_id": uid,
                 "username": uname, "avatar_emoji": emoji, "message": msg,
@@ -1182,98 +1340,115 @@ async def ws_room(websocket: WebSocket, room_id: int):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/leaderboard")
 def get_leaderboard(request: Request, period: str = "weekly"):
-    get_user(request); conn = get_conn(); c = conn.cursor()
-
-    if period == "weekly":
-        cutoff = (date.today() - timedelta(days=7)).strftime("%d-%m-%Y")
-        c.execute("""SELECT ss.user_id, u.username, p.avatar_emoji, p.role, p.country,
-                            SUM(ss.minutes) as total_mins, st.xp, st.level
-                     FROM study_sessions ss
-                     JOIN users u ON ss.user_id=u.id
-                     LEFT JOIN user_profiles p ON ss.user_id=p.user_id
-                     LEFT JOIN user_stats st ON ss.user_id=st.id
-                     WHERE ss.date >= ?
-                     GROUP BY ss.user_id ORDER BY total_mins DESC LIMIT 50""", (cutoff,))
-    elif period == "alltime":
-        c.execute("""SELECT st2.user_id, u.username, p.avatar_emoji, p.role, p.country,
-                            st2.total_minutes as total_mins, st.xp, st.level
-                     FROM subjects_total st2
-                     JOIN users u ON st2.user_id=u.id
-                     LEFT JOIN user_profiles p ON st2.user_id=p.user_id
-                     LEFT JOIN user_stats st ON st2.user_id=st.id
-                     GROUP BY st2.user_id
-                     ORDER BY total_mins DESC LIMIT 50""")
-    else:  # xp
-        c.execute("""SELECT u.id as user_id, u.username, p.avatar_emoji, p.role, p.country,
-                            st.xp, st.level, st.xp as total_mins
-                     FROM user_stats st JOIN users u ON st.id=u.id
-                     LEFT JOIN user_profiles p ON u.id=p.user_id
-                     ORDER BY st.xp DESC LIMIT 50""")
-
-    rows = []
-    for i, r in enumerate(c.fetchall()):
-        rows.append({
-            "rank": i+1, "user_id": r["user_id"], "username": r["username"],
-            "avatar_emoji": r["avatar_emoji"] or "🎓", "role": r["role"] or "student",
-            "country": r["country"] or "", "total_mins": r["total_mins"] or 0,
-            "xp": r["xp"] or 0, "level": r["level"] or 1,
-        })
-    conn.close()
+    get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            if period == "weekly":
+                cutoff = (date.today() - timedelta(days=7)).strftime("%d-%m-%Y")
+                c.execute("""
+                    SELECT ss.user_id, u.username, p.avatar_emoji, p.role, p.country,
+                           SUM(ss.minutes) as total_mins, st.xp, st.level
+                    FROM study_sessions ss
+                    JOIN users u ON ss.user_id=u.id
+                    LEFT JOIN user_profiles p ON ss.user_id=p.user_id
+                    LEFT JOIN user_stats st ON ss.user_id=st.id
+                    WHERE ss.date >= %s
+                    GROUP BY ss.user_id, u.username, p.avatar_emoji, p.role, p.country, st.xp, st.level
+                    ORDER BY total_mins DESC LIMIT 50
+                """, (cutoff,))
+            elif period == "alltime":
+                c.execute("""
+                    SELECT st2.user_id, u.username, p.avatar_emoji, p.role, p.country,
+                           SUM(st2.total_minutes) as total_mins, st.xp, st.level
+                    FROM subjects_total st2
+                    JOIN users u ON st2.user_id=u.id
+                    LEFT JOIN user_profiles p ON st2.user_id=p.user_id
+                    LEFT JOIN user_stats st ON st2.user_id=st.id
+                    GROUP BY st2.user_id, u.username, p.avatar_emoji, p.role, p.country, st.xp, st.level
+                    ORDER BY total_mins DESC LIMIT 50
+                """)
+            else:  # xp
+                c.execute("""
+                    SELECT u.id as user_id, u.username, p.avatar_emoji, p.role, p.country,
+                           st.xp, st.level, st.xp as total_mins
+                    FROM user_stats st JOIN users u ON st.id=u.id
+                    LEFT JOIN user_profiles p ON u.id=p.user_id
+                    ORDER BY st.xp DESC LIMIT 50
+                """)
+            rows = []
+            for i, r in enumerate(c.fetchall()):
+                rows.append({
+                    "rank": i+1, "user_id": r["user_id"], "username": r["username"],
+                    "avatar_emoji": r["avatar_emoji"] or "🎓", "role": r["role"] or "student",
+                    "country": r["country"] or "", "total_mins": r["total_mins"] or 0,
+                    "xp": r["xp"] or 0, "level": r["level"] or 1,
+                })
     return rows
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MONITORING (Teacher/Parent)
+# MONITORING
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/api/monitor")
 def add_monitored(req: MonitorReq, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE username=?", (req.username,))
-    row = c.fetchone()
-    if not row: raise HTTPException(404, "User not found")
-    if row["id"] == uid: raise HTTPException(400, "Cannot monitor yourself")
-    c.execute("INSERT OR IGNORE INTO monitored_users(monitor_id,student_id,relationship,created_at) VALUES(?,?,?,?)",
-              (uid, row["id"], req.relationship, datetime.now().strftime("%Y-%m-%d")))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT id FROM users WHERE username=%s", (req.username,))
+            row = c.fetchone()
+            if not row: raise HTTPException(404, "User not found")
+            if row["id"] == uid: raise HTTPException(400, "Cannot monitor yourself")
+            c.execute(
+                "INSERT INTO monitored_users(monitor_id,student_id,relationship,created_at) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (uid, row["id"], req.relationship, datetime.now().strftime("%Y-%m-%d"))
+            )
     return {"message": f"Now monitoring @{req.username}"}
 
 @app.delete("/api/monitor/{student_id}")
 def remove_monitored(student_id: int, request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM monitored_users WHERE monitor_id=? AND student_id=?", (uid, student_id))
-    conn.commit(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("DELETE FROM monitored_users WHERE monitor_id=%s AND student_id=%s", (uid, student_id))
     return {"message": "Removed"}
 
 @app.get("/api/monitor/students")
 def get_monitored_students(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("""SELECT mu.student_id, mu.relationship, u.username, p.avatar_emoji
-                 FROM monitored_users mu JOIN users u ON mu.student_id=u.id
-                 LEFT JOIN user_profiles p ON mu.student_id=p.user_id
-                 WHERE mu.monitor_id=?""", (uid,))
-    students = []
-    for r in c.fetchall():
-        sid = r["student_id"]
-        c.execute("SELECT xp, level FROM user_stats WHERE id=?", (sid,))
-        st = c.fetchone()
-        c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=? ORDER BY rowid DESC LIMIT 30", (sid,))
-        sl: dict = {}
-        for s in c.fetchall():
-            sl.setdefault(s["subject"], {})
-            sl[s["subject"]][s["date"]] = sl[s["subject"]].get(s["date"], 0) + s["minutes"]
-        today = date.today().strftime("%d-%m-%Y")
-        today_mins = sum(sl.get(s, {}).get(today, 0) for s in sl)
-        streak = compute_streak(sl)
-        students.append({
-            "user_id": sid, "username": r["username"],
-            "avatar_emoji": r["avatar_emoji"] or "🎓",
-            "relationship": r["relationship"],
-            "xp": st["xp"] if st else 0, "level": st["level"] if st else 1,
-            "today_mins": today_mins, "streak": streak,
-        })
-    conn.close(); return students
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("""
+                SELECT mu.student_id, mu.relationship, u.username, p.avatar_emoji
+                FROM monitored_users mu JOIN users u ON mu.student_id=u.id
+                LEFT JOIN user_profiles p ON mu.student_id=p.user_id
+                WHERE mu.monitor_id=%s
+            """, (uid,))
+            students = []
+            for r in c.fetchall():
+                sid = r["student_id"]
+                c.execute("SELECT xp, level FROM user_stats WHERE id=%s", (sid,))
+                st = c.fetchone()
+                c.execute(
+                    "SELECT subject, date, minutes FROM study_sessions WHERE user_id=%s ORDER BY id DESC LIMIT 30",
+                    (sid,)
+                )
+                sl: dict = {}
+                for s in c.fetchall():
+                    sl.setdefault(s["subject"], {})
+                    sl[s["subject"]][s["date"]] = sl[s["subject"]].get(s["date"], 0) + s["minutes"]
+                today = date.today().strftime("%d-%m-%Y")
+                today_mins = sum(sl.get(s, {}).get(today, 0) for s in sl)
+                streak = compute_streak(sl)
+                students.append({
+                    "user_id": sid, "username": r["username"],
+                    "avatar_emoji": r["avatar_emoji"] or "🎓",
+                    "relationship": r["relationship"],
+                    "xp": st["xp"] if st else 0, "level": st["level"] if st else 1,
+                    "today_mins": today_mins, "streak": streak,
+                })
+    return students
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI CHATBOT (Groq/Llama)
+# AI CHATBOT (Groq)
 # ══════════════════════════════════════════════════════════════════════════════
 SYSTEM_PROMPTS = {
     "student": (
@@ -1298,12 +1473,11 @@ SYSTEM_PROMPTS = {
 @app.post("/api/chatbot")
 async def chatbot(req: ChatbotReq, request: Request):
     uid = get_user(request)
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT role FROM user_profiles WHERE user_id=?", (uid,))
-    p = c.fetchone()
-    role = p["role"] if p else "student"
-    conn.close()
-
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute("SELECT role FROM user_profiles WHERE user_id=%s", (uid,))
+            p = c.fetchone()
+    role   = p["role"] if p else "student"
     system = SYSTEM_PROMPTS.get(role, SYSTEM_PROMPTS["student"])
     messages = [{"role": "system", "content": system}]
     for h in (req.history or [])[-8:]:
@@ -1324,25 +1498,41 @@ async def chatbot(req: ChatbotReq, request: Request):
                 reply = data["choices"][0]["message"]["content"]
                 return {"reply": reply, "source": "llama"}
         except Exception as e:
-            reply = ("Error")  # Fall through to tips
+            return {"reply": f"AI temporarily unavailable: {str(e)}", "source": "error"}
+
+    return {
+        "reply": (
+            "💡 AI chatbot requires a GROQ_API_KEY environment variable.\n\n"
+            "Get a free key at console.groq.com — it gives you Llama 3.1 for free.\n"
+            "Then set GROQ_API_KEY in your Render environment variables."
+        ),
+        "source": "fallback"
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/export/pdf")
 def export_pdf(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=? ORDER BY date DESC", (uid,))
-    rows = c.fetchall()
-    c.execute("SELECT xp, level FROM user_stats WHERE id=?", (uid,)); stats = c.fetchone()
-    conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "SELECT subject, date, minutes FROM study_sessions WHERE user_id=%s ORDER BY date DESC", (uid,)
+            )
+            rows = c.fetchall()
+            c.execute("SELECT xp, level FROM user_stats WHERE id=%s", (uid,))
+            stats = c.fetchone()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter)
     styles = getSampleStyleSheet()
     story = [
         Paragraph("StudyNest — Progress Report", styles["Title"]),
         Spacer(1,10),
-        Paragraph(f"Generated: {date.today()} | Level: {stats['level'] if stats else 1} | XP: {stats['xp'] if stats else 0}", styles["Normal"]),
+        Paragraph(
+            f"Generated: {date.today()} | Level: {stats['level'] if stats else 1} | XP: {stats['xp'] if stats else 0}",
+            styles["Normal"]
+        ),
         Spacer(1,12)
     ]
     td = [["Date","Subject","Minutes"]]
@@ -1362,9 +1552,13 @@ def export_pdf(request: Request):
 
 @app.get("/api/export/csv")
 def export_csv(request: Request):
-    uid = get_user(request); conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT subject, date, minutes FROM study_sessions WHERE user_id=? ORDER BY date DESC", (uid,))
-    rows = c.fetchall(); conn.close()
+    uid = get_user(request)
+    with get_conn() as conn:
+        with get_cursor(conn) as c:
+            c.execute(
+                "SELECT subject, date, minutes FROM study_sessions WHERE user_id=%s ORDER BY date DESC", (uid,)
+            )
+            rows = c.fetchall()
     lines = ["Date,Subject,Minutes"] + [f"{r['date']},{r['subject']},{r['minutes']}" for r in rows]
     return StreamingResponse(io.StringIO("\n".join(lines)), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=studynest_{date.today()}.csv"})
@@ -1372,10 +1566,15 @@ def export_csv(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 # STATIC / FRONTEND
 # ══════════════════════════════════════════════════════════════════════════════
-app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+try:
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+except Exception:
+    pass
 
 @app.get("/")
 @app.get("/{path:path}")
 def serve_frontend(path: str = ""):
     index = os.path.join(FRONTEND_DIR, "index.html")
-    return FileResponse(index)
+    if os.path.exists(index):
+        return FileResponse(index)
+    return {"message": "StudyNest API running. Place index.html in same directory as main.py."}
