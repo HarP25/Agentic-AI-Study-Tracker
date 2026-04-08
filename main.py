@@ -11,7 +11,8 @@ import pandas as pd
 import jwt as pyjwt
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
+from fastapi.responses import FileResponse
 
 # ── PostgreSQL connection pool ────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors as rl_colors
 from reportlab.lib.pagesizes import letter
+from fastapi.responses import FileResponse
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 SECRET_KEY         = os.environ.get("SECRET_KEY", "change-me-in-production-please")
@@ -287,7 +289,13 @@ def init_db():
                     )
 
 # ── APP ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="StudyNest API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="Plexus API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -298,11 +306,6 @@ app.add_middleware(
 )
 
 executor = ThreadPoolExecutor(max_workers=4)
-
-# Init DB on startup
-@app.on_event("startup")
-def on_startup():
-    init_db()
 
 # ── WEBSOCKET MANAGER ─────────────────────────────────────────────────────────
 class ConnectionManager:
@@ -584,6 +587,14 @@ def parse_fields_of_study(value):
         return []
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FAVICON
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    return FileResponse("favicon.ico")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AUTH
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/api/auth/register")
@@ -606,7 +617,7 @@ def register(req: RegisterReq):
                     "INSERT INTO user_profiles(user_id,joined_at) VALUES(%s,%s) ON CONFLICT DO NOTHING",
                     (uid, datetime.now().strftime("%Y-%m-%d"))
                 )
-        return {"message": "Account created! Welcome to StudyNest."}
+        return {"message": "Account created! Welcome to Plexus."}
     except Exception as e:
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
             raise HTTPException(400, "Username already taken")
@@ -1452,18 +1463,18 @@ def get_monitored_students(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 SYSTEM_PROMPTS = {
     "student": (
-        "You are StudyNest AI, a warm and encouraging study coach. Help students with: "
+        "You are Plexus AI, a warm and encouraging study coach. Help students with: "
         "study techniques, subject questions, time management, motivation, stress, exam prep. "
         "Be concise (2-3 paragraphs max), practical, and always end with an actionable tip. "
         "Use emojis occasionally. Never give medical/legal advice."
     ),
     "teacher": (
-        "You are StudyNest AI, a professional educational assistant for teachers. "
+        "You are Plexus AI, a professional educational assistant for teachers. "
         "Help with: lesson planning, student engagement, assessment strategies, differentiated instruction, "
         "classroom management, educational research. Be evidence-based and professional."
     ),
     "parent": (
-        "You are StudyNest AI, a supportive guide for parents supporting their children's education. "
+        "You are Plexus AI, a supportive guide for parents supporting their children's education. "
         "Help with: creating study environments, motivating children, understanding curriculum, "
         "screen time management, communication with teachers, recognizing learning difficulties. "
         "Be warm, practical, and non-judgmental."
@@ -1527,7 +1538,7 @@ def export_pdf(request: Request):
     doc = SimpleDocTemplate(buf, pagesize=letter)
     styles = getSampleStyleSheet()
     story = [
-        Paragraph("StudyNest — Progress Report", styles["Title"]),
+        Paragraph("Plexus — Progress Report", styles["Title"]),
         Spacer(1,10),
         Paragraph(
             f"Generated: {date.today()} | Level: {stats['level'] if stats else 1} | XP: {stats['xp'] if stats else 0}",
@@ -1548,7 +1559,7 @@ def export_pdf(request: Request):
     ]))
     story.append(t); doc.build(story); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=studynest_report_{date.today()}.pdf"})
+        headers={"Content-Disposition": f"attachment; filename=plexus_report_{date.today()}.pdf"})
 
 @app.get("/api/export/csv")
 def export_csv(request: Request):
@@ -1561,7 +1572,7 @@ def export_csv(request: Request):
             rows = c.fetchall()
     lines = ["Date,Subject,Minutes"] + [f"{r['date']},{r['subject']},{r['minutes']}" for r in rows]
     return StreamingResponse(io.StringIO("\n".join(lines)), media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=studynest_{date.today()}.csv"})
+        headers={"Content-Disposition": f"attachment; filename=plexus_{date.today()}.csv"})
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STATIC / FRONTEND
@@ -1572,9 +1583,17 @@ except Exception:
     pass
 
 @app.get("/")
-@app.get("/{path:path}")
 def serve_frontend(path: str = ""):
     index = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index):
         return FileResponse(index)
-    return {"message": "StudyNest API running. Place index.html in same directory as main.py."}
+    return {"message": "Plexus API running. Place index.html in same directory as main.py."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=False
+    )
