@@ -741,7 +741,12 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 
 /* ═══════════════ RESPONSIVE ═══════════════ */
 @media(max-width:900px){
-  #sidebar{display:none}
+  #sidebar{display:none;position:fixed;left:-280px;top:0;width:280px;height:100vh;z-index:1000;transition:left 0.3s ease;background:var(--bg);border-right:1px solid var(--border);overflow-y:auto}
+  #sidebar.mobile-open{display:block;left:0}
+  .mobile-nav-toggle{display:block;position:fixed;top:16px;left:16px;z-index:999;background:var(--primary);color:white;border:none;border-radius:6px;padding:8px 12px;font-size:18px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.15)}
+  .mobile-nav-toggle:hover{background:var(--primary-dark)}
+  .mobile-nav-overlay{display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.5);z-index:999}
+  #sidebar.mobile-open ~ .mobile-nav-overlay{display:block}
   #main{margin-left:0;padding:16px}
   .g5,.g4{grid-template-columns:1fr 1fr}
   .g3{grid-template-columns:1fr 1fr}
@@ -780,6 +785,8 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 </div>
 
 <div id="app" style="display:none;width:100%">
+  <button id="mobile-nav-toggle" class="mobile-nav-toggle" onclick="toggleMobileNav()">☰</button>
+  <div id="mobile-nav-overlay" class="mobile-nav-overlay" onclick="toggleMobileNav()"></div>
   <nav id="sidebar">
     <div class="sb-logo">
       <div><div class="logo-text">Velocera</div><div class="logo-sub">Learn Together</div></div>
@@ -1363,6 +1370,10 @@ function navigate(page){
       (page==='ai'&&t.includes('ai tutor'));
     b.classList.toggle('active',match);
   });
+  // Close mobile nav after navigation
+  if(window.innerWidth <= 900){
+    document.getElementById('sidebar').classList.remove('mobile-open');
+  }
   const fns={
     dashboard:renderDashboard,study:renderStudy,pomodoro:renderPomodoro,
     planner:renderPlanner,progress:renderProgress,community:renderCommunity,
@@ -1370,6 +1381,16 @@ function navigate(page){
     profile:renderProfile,ai:()=>{},account:renderAccount,
   };
   if(fns[page])fns[page]();
+}
+
+function toggleMobileNav(){
+  const sidebar = document.getElementById('sidebar');
+  const isOpen = sidebar.classList.contains('mobile-open');
+  if(isOpen){
+    sidebar.classList.remove('mobile-open');
+  }else{
+    sidebar.classList.add('mobile-open');
+  }
 }
 
 // ── STATS ──
