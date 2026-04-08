@@ -295,7 +295,7 @@ async def lifespan(app: FastAPI):
     init_db()
     yield
 
-app = FastAPI(title="Plexus API", lifespan=lifespan)
+app = FastAPI(title="Velocera API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -617,7 +617,7 @@ def register(req: RegisterReq):
                     "INSERT INTO user_profiles(user_id,joined_at) VALUES(%s,%s) ON CONFLICT DO NOTHING",
                     (uid, datetime.now().strftime("%Y-%m-%d"))
                 )
-        return {"message": "Account created! Welcome to Plexus."}
+        return {"message": "Account created! Welcome to Velocera."}
     except Exception as e:
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
             raise HTTPException(400, "Username already taken")
@@ -1463,18 +1463,18 @@ def get_monitored_students(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 SYSTEM_PROMPTS = {
     "student": (
-        "You are Plexus AI, a warm and encouraging study coach. Help students with: "
+        "You are Velocera AI, a warm and encouraging study coach. Help students with: "
         "study techniques, subject questions, time management, motivation, stress, exam prep. "
         "Be concise (2-3 paragraphs max), practical, and always end with an actionable tip. "
         "Use emojis occasionally. Never give medical/legal advice."
     ),
     "teacher": (
-        "You are Plexus AI, a professional educational assistant for teachers. "
+        "You are Velocera AI, a professional educational assistant for teachers. "
         "Help with: lesson planning, student engagement, assessment strategies, differentiated instruction, "
         "classroom management, educational research. Be evidence-based and professional."
     ),
     "parent": (
-        "You are Plexus AI, a supportive guide for parents supporting their children's education. "
+        "You are Velocera AI, a supportive guide for parents supporting their children's education. "
         "Help with: creating study environments, motivating children, understanding curriculum, "
         "screen time management, communication with teachers, recognizing learning difficulties. "
         "Be warm, practical, and non-judgmental."
@@ -1538,7 +1538,7 @@ def export_pdf(request: Request):
     doc = SimpleDocTemplate(buf, pagesize=letter)
     styles = getSampleStyleSheet()
     story = [
-        Paragraph("Plexus — Progress Report", styles["Title"]),
+        Paragraph("Velocera — Progress Report", styles["Title"]),
         Spacer(1,10),
         Paragraph(
             f"Generated: {date.today()} | Level: {stats['level'] if stats else 1} | XP: {stats['xp'] if stats else 0}",
@@ -1559,7 +1559,7 @@ def export_pdf(request: Request):
     ]))
     story.append(t); doc.build(story); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=plexus_report_{date.today()}.pdf"})
+        headers={"Content-Disposition": f"attachment; filename=velocera_report_{date.today()}.pdf"})
 
 @app.get("/api/export/csv")
 def export_csv(request: Request):
@@ -1572,7 +1572,7 @@ def export_csv(request: Request):
             rows = c.fetchall()
     lines = ["Date,Subject,Minutes"] + [f"{r['date']},{r['subject']},{r['minutes']}" for r in rows]
     return StreamingResponse(io.StringIO("\n".join(lines)), media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=plexus_{date.today()}.csv"})
+        headers={"Content-Disposition": f"attachment; filename=velocera_{date.today()}.csv"})
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STATIC / FRONTEND
@@ -1587,7 +1587,7 @@ def serve_frontend(path: str = ""):
     index = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index):
         return FileResponse(index)
-    return {"message": "Plexus API running. Place index.html in same directory as main.py."}
+    return {"message": "Velocera API running. Place index.html in same directory as main.py."}
 
 if __name__ == "__main__":
     import uvicorn
