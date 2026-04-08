@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Plexus</title>
+<title>Velocera</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -756,7 +756,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 <body>
 <div id="auth-page">
   <div class="auth-box">
-    <div class="auth-logo">Plexus </div>
+    <div class="auth-logo">Velocera </div>
     <div class="auth-sub">The social learning platform for curious minds 🧠</div>
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('login')">Login</button>
@@ -767,14 +767,14 @@ tr:hover td{background:rgba(255,255,255,0.02)}
       <div class="form-group"><label>Password</label>
         <input type="password" id="l-pass" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"/></div>
       <div id="login-msg"></div>
-      <button class="btn btn-primary btn-full" id="btn-login" onclick="doLogin()">Login to Plexus →</button>
+      <button class="btn btn-primary btn-full" id="btn-login" onclick="doLogin()">Login to Velocera →</button>
     </div>
     <div id="tab-register" class="tab-content">
       <div class="form-group"><label>Username</label><input type="text" id="r-user" placeholder="choose_your_handle"/></div>
       <div class="form-group"><label>Email (optional)</label><input type="email" id="r-email" placeholder="you@example.com"/></div>
       <div class="form-group"><label>Password (min 6 chars)</label><input type="password" id="r-pass" placeholder="••••••••"/></div>
       <div id="register-msg"></div>
-      <button class="btn btn-primary btn-full" id="btn-register" onclick="doRegister()">Join Plexus →</button>
+      <button class="btn btn-primary btn-full" id="btn-register" onclick="doRegister()">Join Velocera →</button>
     </div>
   </div>
 </div>
@@ -782,7 +782,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 <div id="app" style="display:none;width:100%">
   <nav id="sidebar">
     <div class="sb-logo">
-      <div><div class="logo-text">Plexus</div><div class="logo-sub">Learn Together</div></div>
+      <div><div class="logo-text">Velocera</div><div class="logo-sub">Learn Together</div></div>
     </div>
     <div class="nav-section">Core</div>
     <button class="nav-item active" onclick="navigate('dashboard')"><span class="nav-icon">📊</span> Dashboard</button>
@@ -1088,7 +1088,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
     </div>
     <!-- LEADERBOARD -->
     <div id="page-leaderboard" class="page">
-      <div class="page-header"><h1>🥇 Leaderboard</h1><p>See how you rank in the Plexus community</p></div>
+      <div class="page-header"><h1>🥇 Leaderboard</h1><p>See how you rank in the Velocera community</p></div>
       <div class="tabs" style="max-width:380px;margin-bottom:22px">
         <button class="tab-btn active" onclick="loadLeaderboard('weekly')">📅 Weekly</button>
         <button class="tab-btn" onclick="loadLeaderboard('alltime')">⏳ All Time</button>
@@ -1108,7 +1108,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
         <div class="ai-messages" id="ai-messages">
           <div class="ai-msg assistant">
             <div class="ai-avatar">🤖</div>
-            <div class="ai-bubble"><strong>Hi! I'm your Plexus AI Tutor.</strong><br/>I help students, teachers, and parents with study strategies, motivation, and more.<br/><br/>What's on your mind? 📚</div>
+            <div class="ai-bubble"><strong>Hi! I'm your Velocera AI Tutor.</strong><br/>I help students, teachers, and parents with study strategies, motivation, and more.<br/><br/>What's on your mind? 📚</div>
           </div>
         </div>
         <div class="ai-suggestions" id="ai-suggestions">
@@ -1791,7 +1791,7 @@ async function pomoComplete(){
   S.pomodoro.remaining=getModeDuration();
   document.getElementById('btn-pomo-start').textContent='▶ Start';
   updatePomoDisplay();
-  if(Notification.permission==='granted')new Notification('Plexus',{body:`${label} session complete!`});
+  if(Notification.permission==='granted')new Notification('Velocera',{body:`${label} session complete!`});
 }
 function pomoReset(){clearInterval(S.pomodoro.interval);S.pomodoro.running=false;S.pomodoro.remaining=getModeDuration();document.getElementById('btn-pomo-start').textContent='▶ Start';updatePomoDisplay();}
 function pomoSkip(){clearInterval(S.pomodoro.interval);S.pomodoro.running=false;S.pomodoro.sessions++;const c=S.pomodoro.sessions;S.pomodoro.mode=S.pomodoro.mode==='work'?(c%4===0?'long':'short'):'work';S.pomodoro.remaining=getModeDuration();document.getElementById('pomo-sessions').textContent=S.pomodoro.sessions;document.getElementById('btn-pomo-start').textContent='▶ Start';updatePomoDisplay();}
